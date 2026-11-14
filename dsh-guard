@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+# dsh-guard — DSH 插件体检 + 启动自愈。
+#
+# 为什么不在应用里做：DSH 的 web boot 只要有一个插件没激活，就停在它自己的
+# "Failed to load plugins" 页面，应用根本不会挂载 —— 那时候插件 ctx 都不存在，
+# 没有任何插件跑得起来，自然也弹不出告示。所以这层只能待在进程外面。
+#
+# 用法：
+#   dsh-guard --check            体检：patch 里的每个插件能不能解析、能不能 import
+#   dsh-guard --heal-log <日志>  事后：从启动日志认出是哪个插件，停用它并告知
+#   dsh-guard                    守护启动：前台跑 dsh web，失败则自愈并重启一次
+#
+# 可调环境变量（测试用）：
+#   DSH_HOME / DSH_PROFILE_DIR / DSH_WEB_CMD / DSH_GUARD_LOG / DSH_GUARD_MAX / DSH_GUARD_NO_UI
+set -uo pipefail
+
+DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
+PROFILE_DIR="${DSH_PROFILE_DIR:-$DSH_HOME/profiles/web}"
+PATCH="$PROFILE_DIR/cordis.patch.yml"
+LOG="${DSH_GUARD_LOG:-$DSH_HOME/guard.log}"
+WEB_CMD="${DSH_WEB_CMD:-node $HOME/.dsh-cli/0.2.2-rc.1/node_modules/.bin/dsh web}"
+MAX_RESTART="${DSH_GUARD_MAX:-1}"
+NO_UI="${DSH_GUARD_NO_UI:-0}"
+
+mkdir -p "$(dirname "$LOG")"
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+# ── patch 里列出的插件（id 或 name）──────────────────────────────────────────
+plugins_in_patch() {
+  python3 - "$PATCH" <<'PY'
+import sys, json
+path = sys.argv[1]
+try:
+    import yaml
+    doc = yaml.safe_load(open(path, encoding='utf-8')) or []
+except Exception:
+    doc = []
+seen = []
+for entry in doc if isinstance(doc, list) else []:
+    rows = entry.get('insert') if isinstance(entry, dict) else None
+    for row in (rows if isinstance(rows, list) else [entry]):
+        if not isinstance(row, dict):
+            continue
+        name = row.get('name') or row.get('id')
+        if not isinstance(name, str) or name in seen:
+            continue
+        seen.append(name)
+        print(json.dumps({"name": name, "disabled": row.get('disabled') is True}))
+PY
+}
+
+# ── 把某个插件在 patch 里标成 disabled，只插一行，注释原样保留 ──────────────
+disable_target() {
+  local target="$1"
+  python3 - "$PATCH" "$target" <<'PY'
+import sys, re, json
+path, target = sys.argv[1], sys.argv[2]
+raw = open(path, encoding='utf-8').read()
+lines = raw.split('\n')
+pat = re.compile(r'^(\s*)(-\s+)?(?:id|name):\s*' + re.escape(target) + r'\s*$')
+out, hit = [], False
+i = 0
+while i < len(lines):
+    m = re.match(r'^(\s*)-(\s+)', lines[i])
+    if m is None:
+        out.append(lines[i]); i += 1; continue
+    dash = len(m.group(1))
+    j = i + 1
+    while j < len(lines):
+        if not lines[j].strip():
+            j += 1; continue
+        if len(lines[j]) - len(lines[j].lstrip()) <= dash:
+            break
+        j += 1
+    inserted = False
+    for k in range(i, j):
+        out.append(lines[k])
+        mm = pat.match(lines[k])
+        if mm is None:
+            continue
+        hit = True
+        if inserted:
+            continue
+        indent = len(mm.group(1)) + (len(mm.group(2)) if mm.group(2) else 0)
+        if any(re.match(r'^\s*disabled:\s*true\s*$', l) for l in lines[i:j]):
+            inserted = True
+            continue
+        out.append(' ' * indent + 'disabled: true')
+        inserted = True
+    i = j
+if not hit:
+    print(json.dumps({"ok": False, "error": "target not found"})); sys.exit(0)
+new = '\n'.join(out)
+try:
+    import yaml
+    doc = yaml.safe_load(new)
+except Exception as e:
+    print(json.dumps({"ok": False, "error": "yaml: " + str(e)})); sys.exit(0)
+def found(node):
+    rows = node.get('insert') if isinstance(node, dict) else None
+    if isinstance(rows, list):
+        for r in rows:
+            if isinstance(r, dict) and (r.get('id') == target or r.get('name') == target) and r.get('disabled') is True:
+                return True
+    return isinstance(node, dict) and (node.get('id') == target or node.get('name') == target) and node.get('disabled') is True
+if not isinstance(doc, list) or not any(found(n) for n in doc):
+    print(json.dumps({"ok": False, "error": "edit did not take effect"})); sys.exit(0)
+open(path + '.bak-guard', 'w', encoding='utf-8').write(raw)
+open(path, 'w', encoding='utf-8').write(new)
+print(json.dumps({"ok": True, "disabled": target}))
+PY
+}
+
+# ── 从日志里认出被点名的插件 ────────────────────────────────────────────────
+blame_from_log() {
+  local text="$1"
+  local name
+  name=$(grep -oE 'did not activate[[:space:]]+[@A-Za-z0-9/_.-]+' <<<"$text" | head -1 | awk '{print $NF}')
+  [ -z "$name" ] && name=$(grep -oE 'Failed to load plugins[[:space:]]+[@A-Za-z0-9/_.-]+' <<<"$text" | head -1 | awk '{print $NF}')
+  [ -z "$name" ] && name=$(grep -oE 'web boot:.*?([@A-Za-z0-9/_.-]+): ' <<<"$text" | head -1 | sed -E 's/.*?([@A-Za-z0-9/_.-]+): $/\1/')
+  printf '%s' "$name"
+}
+
+# ── 这个插件该去哪报错：读它自己的 repository 字段 ──────────────────────────
+issue_url_for() {
+  local name="$1"
+  python3 - "$PROFILE_DIR/node_modules/$name/package.json" "$name" <<'PY'
+import sys, json, re
+path, name = sys.argv[1], sys.argv[2]
+fallback = 'https://github.com/harm-m422/dsh-guard/issues/new'
+try:
+    pkg = json.load(open(path, encoding='utf-8'))
+except Exception:
+    print(fallback); sys.exit(0)
+repo = pkg.get('repository')
+url = ''
+if isinstance(repo, str): url = repo
+elif isinstance(repo, dict): url = repo.get('url') or ''
+if not url:
+    print(fallback); sys.exit(0)
+url = re.sub(r'^git\+', '', url)
+url = re.sub(r'\.git$', '', url)
+if not url.startswith('http'):
+    print(fallback); sys.exit(0)
+print(url.rstrip('/') + '/issues/new')
+PY
+}
+
+tell_user() {
+  local target="$1" detail="$2"
+  local issue
+  issue="$(issue_url_for "$target")"
+  if [ "$NO_UI" = "1" ] || [ -z "${DISPLAY:-}" ] || ! command -v zenity >/dev/null 2>&1; then
+    notify-send 'DSH 插件拖垮了启动' "已自动停用 $target，重启后可用；详情见 $LOG" 2>/dev/null || true
+    return
+  fi
+  local choice
+  choice=$(zenity --list --title='插件让 harness 起不来' --width=640 --height=320 \
+    --text="<b>$target</b> 导致此次启动失败，已经自动停用它并重启。
+
+$detail" \
+    --column='选' --column='动作' --hide-header \
+    TRUE '去 GitHub 提交错误（带日志）' \
+    FALSE '忽略，保持停用' 2>/dev/null)
+  case "$choice" in
+    *提交错误*)
+      local url
+      url=$(python3 - "$target" "$detail" "$issue" <<'PYURL'
+import sys, urllib.parse
+target, detail, issue = sys.argv[1], sys.argv[2], sys.argv[3]
+title = urllib.parse.quote('启动失败：' + target)
+body = urllib.parse.quote(('插件：%s\n\n启动报错：\n%s\n' % (target, detail))[:1500])
+print('%s?title=%s&body=%s' % (issue, title, body))
+PYURL
+)
+      xdg-open "$url" >/dev/null 2>&1 || true
+      ;;
+    *) : ;;
+  esac
+}
+
+# ── 体检：patch 里的每个插件能不能被装起来 ─────────────────────────────────
+if [ "${1:-}" = "--check" ]; then
+  echo "profile : $PROFILE_DIR"
+  echo "patch   : $PATCH"
+  if [ ! -f "$PATCH" ]; then
+    echo "yaml    : （还没有这个 profile —— 先启动一次 DSH 再回来体检）"
+    exit 0
+  fi
+  python3 - "$PATCH" <<'PYCHK'
+import sys
+path = sys.argv[1]
+try:
+    import yaml
+    doc = yaml.safe_load(open(path, encoding='utf-8')) or []
+    print('yaml    : ok (%d rows)' % len(doc))
+except Exception as e:
+    print('yaml    : BROKEN ->', e); sys.exit(1)
+PYCHK
+  while IFS= read -r row; do
+    name=$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["name"])' "$row")
+    off=$(python3 -c 'import json,sys;print("disabled" if json.loads(sys.argv[1])["disabled"] else "enabled")' "$row")
+    if [[ "$name" == @* ]]; then
+      dir="$PROFILE_DIR/node_modules/$name"
+    else
+      dir="$PROFILE_DIR/node_modules/$name"
+    fi
+    if [ ! -d "$dir" ]; then
+      if [[ "$name" == @* ]]; then
+        printf 'engine  : %-28s %s  核心包（在 dsh 安装目录里）\n' "$name" "$off"
+      else
+        printf 'engine  : %-28s %s  未安装\n' "$name" "$off"
+      fi
+      continue
+    fi
+    ver=$(python3 -c "import json;print(json.load(open('$dir/package.json'))['version'])" 2>/dev/null || echo '?')
+    entry=$(python3 - "$dir/package.json" <<'PYENTRY'
+import sys, json
+try: pkg = json.load(open(sys.argv[1], encoding='utf-8'))
+except Exception: pkg = {}
+e = pkg.get('main')
+if not e:
+    ex = pkg.get('exports')
+    if isinstance(ex, str): e = ex
+    elif isinstance(ex, dict):
+        dot = ex.get('.')
+        if isinstance(dot, str): e = dot
+        elif isinstance(dot, dict): e = dot.get('import') or dot.get('default') or dot.get('require')
+print(e or 'index.js')
+PYENTRY
+)
+    if [ ! -f "$dir/$entry" ]; then
+      printf 'engine  : %-28s %s  v%s  缺入口 %s\n' "$name" "$off" "$ver" "$entry"
+      continue
+    fi
+    if node --check "$dir/$entry" >/tmp/dsh-guard-check.log 2>&1 &&
+       node --input-type=module -e "import('$dir/$entry').then(()=>process.exit(0)).catch(e=>{console.error(String(e.message||e));process.exit(1)})" >>/tmp/dsh-guard-check.log 2>&1; then
+      printf 'engine  : %-28s %s  v%s  可加载（%s）\n' "$name" "$off" "$ver" "$entry"
+    else
+      printf 'engine  : %-28s %s  v%s  加载失败 -> %s\n' "$name" "$off" "$ver" "$(head -c 160 /tmp/dsh-guard-check.log | tr '\n' ' ')"
+    fi
+  done < <(plugins_in_patch)
+  exit 0
+fi
+
+# ── 事后修复：给一个启动日志，认出插件，停用并告知 ─────────────────────────
+if [ "${1:-}" = "--heal-log" ]; then
+  logfile="${2:-$LOG}"
+  [ -f "$logfile" ] || { echo "no log: $logfile" >&2; exit 1; }
+  tail -n 300 "$logfile" > /tmp/dsh-guard-tail.log
+  if ! grep -qiE 'did not activate|Failed to load plugins|web boot:' /tmp/dsh-guard-tail.log; then
+    exit 1
+  fi
+  target="$(blame_from_log "$(cat /tmp/dsh-guard-tail.log)")"
+  if [ -z "$target" ]; then
+    log 'heal-log: boot failed but no plugin named in the log'
+    exit 1
+  fi
+  detail="$(grep -iE 'did not activate|Failed to load plugins|web boot:' /tmp/dsh-guard-tail.log | head -3 | tr '\n' ' ')"
+  log "heal-log: blamed=$target detail=$detail"
+  result="$(disable_target "$target")"
+  log "heal-log disable: $result"
+  if ! grep -q '"ok": true' <<<"$result"; then
+    echo "disable failed: $result" >&2
+    exit 1
+  fi
+  tell_user "$target" "$detail"
+  exit 0
+fi
+
+# ── 给桌面入口用：已经有一个实例在跑就别再开一个 ──────────────────────────
+CHECK_PORT="${DSH_WEB_PORT:-3080}"
+if command -v ss >/dev/null 2>&1 && ss -ltnH "sport = :$CHECK_PORT" 2>/dev/null | grep -q LISTEN; then
+  notify-send 'DSH' "已经在运行（$CHECK_PORT），没有重复启动" 2>/dev/null || true
+  exit 0
+fi
+
+# ── 守护启动：一条逐级降级的恢复阶梯 ────────────────────────────────────────
+# 为什么是阶梯：插件坏了、干净的 harness 也可能被别的东西拖住、最后也可能是
+# harness 自己坏了。一次只降一级，并且每一级都给足 120 秒——启动慢不等于启动失败。
+PORT="${DSH_WEB_PORT:-3080}"
+HEALTH_TIMEOUT="${DSH_HEALTH_TIMEOUT:-120}"
+
+healthy() {
+  if command -v ss >/dev/null 2>&1 && ss -ltnH "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then return 0; fi
+  local code
+  code=$(curl -s -o /dev/null -m 2 --noproxy '*' -w '%{http_code}' "http://127.0.0.1:$PORT/" 2>/dev/null || true)
+  case "$code" in 2*|3*) return 0 ;; esac
+  return 1
+}
+
+start_bg() {
+  local log="$1" rcfile="$2"
+  setsid nohup sh -c "$WEB_CMD; echo \$? > '$rcfile'" >>"$log" 2>&1 </dev/null &
+  echo $!
+}
+
+# 返回 0=起来了 2=日志里明确失败 1=超时 3=进程自己退了（用户关掉）
+wait_healthy() {
+  local log="$1" pid="$2" span="$3"
+  local end=$(( $(date +%s) + span ))
+  while [ "$(date +%s)" -lt "$end" ]; do
+    if grep -qiE 'did not activate|Failed to load plugins|web boot:' "$log" 2>/dev/null; then return 2; fi
+    if healthy; then return 0; fi
+    if ! kill -0 "$pid" 2>/dev/null; then return 3; fi
+    sleep 2
+  done
+  return 1
+}
+
+# 干净启动：把非核心插件全部停用（先整份备份）
+clean_start() {
+  local backup="$PATCH.bak-clean"
+  cp -a "$PATCH" "$backup" 2>/dev/null || true
+  log "clean-start: backup at $backup"
+  local name
+  while IFS= read -r row; do
+    name=$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["name"])' "$row" 2>/dev/null) || continue
+    case "$name" in @*) continue ;; esac
+    # 只停第三方包：核心模块的 id 覆盖（如 compaction-basic）不在 node_modules 里，别碰
+    [ -d "$PROFILE_DIR/node_modules/$name" ] || continue
+    disable_target "$name" >/dev/null 2>&1 || true
+    log "clean-start: disabled $name"
+  done < <(plugins_in_patch)
+}
+
+# harness 自身是否还可能修好：CLI 在不在、能不能报版本、盘还有没有空间
+verify_harness() {
+  local cli note=()
+  cli="$(ls -td "$HOME"/.dsh-cli/*/node_modules/.bin/dsh 2>/dev/null | head -1)"
+  if [ -z "$cli" ]; then
+    note+=("找不到 dsh 可执行文件（~/.dsh-cli/*/node_modules/.bin/dsh）")
+  elif timeout 20 "$cli" --version >/tmp/dsh-guard-ver.log 2>&1; then
+    note+=("dsh 可执行：$(head -c 40 /tmp/dsh-guard-ver.log | tr '\n' ' ')")
+  else
+    note+=("dsh 连 --version 都跑不动：$(head -c 160 /tmp/dsh-guard-ver.log | tr '\n' ' ')")
+  fi
+  local avail
+  avail=$(df -Pk "$DSH_HOME" 2>/dev/null | awk 'NR==2 {print $4}')
+  [ -n "${avail:-}" ] && note+=("DSH_HOME 可用空间：$((avail/1024)) MB")
+  printf '%s\n' "${note[@]}"
+}
+
+give_up() {
+  local detail="$1" diag="$2"
+  log "give-up: ${detail:-（没有可用错误行）}"
+  diag="${diag:-（拿不到诊断信息）}"
+  if [ "$NO_UI" = "1" ] || [ -z "${DISPLAY:-}" ] || ! command -v zenity >/dev/null 2>&1; then
+    notify-send 'DSH 可能已损坏' "停用插件、干净启动都没能起来。$detail" 2>/dev/null || true
+    return
+  fi
+  zenity --list --title='DSH 可能彻底损坏了' --width=680 --height=360 \\
+    --text="连干净启动都失败，问题大概不在插件，而在 harness 本身。
+
+$diag
+
+建议重新安装 harness；装好后第三方插件还是停用状态，可以一个个启用回来。" \\
+    --column='选' --column='动作' --hide-header \\
+    TRUE '打开安装/重装说明' \\
+    FALSE '先退出，我自己看看' 2>/dev/null | grep -q 说明 && xdg-open 'https://github.com/deepseek-ai/deepseek-harness' >/dev/null 2>&1 || true
+}
+
+round=0
+blamed=""
+while : ; do
+  round=$((round + 1))
+  run_log="$(mktemp)"
+  rc_file="$(mktemp)"
+  log "round $round: start ($WEB_CMD)"
+  pid=$(start_bg "$run_log" "$rc_file")
+  wait_healthy "$run_log" "$pid" "$HEALTH_TIMEOUT"
+  verdict=$?
+
+  case "$verdict" in
+    0)
+      log "round $round: healthy on :$PORT"
+      if [ "$round" -gt 1 ]; then
+        notify-send 'DSH 已启动' "第 $round 轮起来了${blamed:+（已停用 $blamed）}" 2>/dev/null || true
+      fi
+      rm -f "$run_log" "$rc_file"
+      exit 0
+      ;;
+    3)
+      rc=$(cat "$rc_file" 2>/dev/null || echo "?")
+      if [ "$rc" = "0" ] || [ "$rc" -ge 128 ] 2>/dev/null; then
+        log "round $round: exited rc=$rc (user closed); nothing to heal"
+        rm -f "$run_log" "$rc_file"
+        exit 0
+      fi
+      log "round $round: crashed rc=$rc"
+      ;;
+  esac
+
+  # 失败：先看清楚是谁
+  target="$(blame_from_log "$(cat "$run_log")")"
+  detail="$(grep -iE 'did not activate|Failed to load plugins|web boot:' "$run_log" | head -3 | tr '\n' ' ')"
+  log "round $round: failed (verdict=$verdict target=${target:-none}) $detail"
+  kill "$pid" 2>/dev/null || true
+  sleep 1
+
+  if [ "$round" -eq 1 ] && [ -n "$target" ]; then
+    result="$(disable_target "$target")"
+    log "round 1: disable $target -> $result"
+    blamed="$target"
+    tell_user "$target" "$detail"
+    rm -f "$run_log" "$rc_file"
+    continue
+  fi
+
+  if [ "$round" -eq 1 ] || [ "$round" -eq 2 ]; then
+    # 第 2 级：干净启动（把所有非核心插件停掉）
+    clean_start
+    rm -f "$run_log" "$rc_file"
+    continue
+  fi
+
+  # 第 3 级：干净启动也不起来 → 校验 harness 并交给人
+  diag="$(verify_harness)"
+  rm -f "$run_log" "$rc_file"
+  give_up "$detail" "$diag"
+  exit 1
+done

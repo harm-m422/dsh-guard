@@ -1,0 +1,19 @@
+# 编辑器 / 系统锁文件（OnlyOffice 打开 Markdown 时会生成）
+.~lock.*#
+.#*
+*~
+*.swp
+.DS_Store
+Thumbs.db
+
+# 分发的压缩包
+*.zip
+
+# 运行产物
+*.log
+*.bak-guard
+*.bak-clean
+
+# Windows
+Thumbs.db
+desktop.ini
