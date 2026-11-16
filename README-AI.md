@@ -93,11 +93,14 @@ engine  : dsh-liquid    enabled  v3.0.0  可加载（lib/index.js）
 
 ## Windows 桌面版（另一个实现，不是同一份脚本）
 
-Windows 上没有 bash，桌面版也从快捷方式启动、没有控制台，所以那边**不做“看日志再救”**，改成**启动前体检**：
+Windows 上没有 bash，桌面版从快捷方式启动、也没有控制台 —— 所以那边**不靠读控制台日志**，
+改成：**启动前体检** + **自己启动并把输出重定向到文件**，再按和 Linux 一样的阶梯恢复：
 
 - 用桌面版自己的运行时（Electron 的 Node）把 profile 里每个插件 import 一次；
 - 导不进来就说明它一定会把启动拖垮 —— 先在 `cordis.patch.yml` 里停用它（只插一行，动手前落一份快照）；
-- 然后才启动桌面版，并弹一个提示框告诉你停用了谁。
+- 自己启动桌面版、把输出重定向到文件，从里面接住**系统分配**的端口；
+- 起不来就从输出里认出被点名的插件再停用；仍不行就干净启动；最后校验安装、建议重装；
+- 「起来了」还要过**宽限期**（`-GraceSec`，默认 120 秒）才算好，只有通过才写 `last-good`。
 
 ### 给 AI 的步骤
 
@@ -116,6 +119,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\dsh-guard.ps1 -Check
 
 默认数据目录：`%USERPROFILE%\.dsh\profiles\web\cordis.patch.yml`。
 找不到时脚本会直接说“没有找到 profile”，**不要猜路径**，让用户告诉你 `%USERPROFILE%\.dsh` 是否存在。
+
+### 自检（可选）
+
+```powershell
+pwsh -NoProfile -File .\test.ps1    # 11 项，只跑逻辑层，不会真的启动桌面版
+```
 
 ### 验收
 
@@ -137,7 +146,8 @@ engine  : @deepseek-ai/...  core（在桌面版安装目录里）
 dsh web: http://127.0.0.1:<PORT>/?token=...
 ```
 
-拿到端口就对它发一个 HTTP 请求；通了算起来，120 秒还没通算失败。
+拿到端口就对它发一个 HTTP 请求；**通了还不算完** —— 还要在宽限期（`-GraceSec`，默认 120 秒）里
+持续确认进程没退、端口没掉。120 秒还没通算失败。
 
 ### 三级阶梯
 

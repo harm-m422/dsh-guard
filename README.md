@@ -107,6 +107,17 @@ $ node test.mjs
 24/24 passed
 ```
 
+Windows 版另有一套，逻辑层在 Linux 上用 pwsh 7 也能跑：
+
+```
+$ pwsh -NoProfile -File windows/test.ps1
+11/11 passed
+```
+
+覆盖体检、快照轮转（连着两次不覆盖 / 不写固定 `.bak`）、宽限期两分支、`last-good`。
+它**不能代替 Windows 实测**：`Start-Process` 重定向、桌面版 exe 的路径探测、GUI 弹窗，
+只有真 Windows 能验。
+
 ### Windows 版同步（windows/dsh-guard.ps1）
 
 同样的三处已经一起改了：
