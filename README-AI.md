@@ -14,7 +14,7 @@
 一个**进程外**的 DSH 插件体检与启动自愈工具。
 
 - `dsh-guard --check`：列出 profile 里每个插件能不能被装起来（YAML 能否解析、入口能否 import、版本、启用状态）。
-- `dsh-guard --heal-log <日志>`：从启动日志里认出是哪个插件让 web boot 失败，只给它插一行 `disabled: true`（先备份 `.bak-guard`），然后弹窗告知。
+- `dsh-guard --heal-log <日志>`：从启动日志里认出是哪个插件让 web boot 失败，只给它插一行 `disabled: true`（动手前先落一份快照到 `$DSH_HOME/guard-snapshots/`），然后弹窗告知。
 - `dsh-guard`：前台启动 `dsh web`，启动失败时自动停用肇事插件并重启一次。
 
 **它不能做什么**（不要向用户承诺）：不能在应用内显示告示（启动失败时应用根本没挂载）；这个 bash 脚本不支持 Windows（Windows 走 `windows\dsh-guard.ps1`）；不会替你更新插件。
@@ -75,7 +75,7 @@ engine  : dsh-liquid    enabled  v3.0.0  可加载（lib/index.js）
 ./install.sh --uninstall
 ```
 
-只删二进制与桌面入口；`--heal-log` 留下的 `.bak-guard` 备份不动。
+只删二进制与桌面入口；`$DSH_HOME/guard-snapshots/` 里的快照不动。
 
 ## 失败时怎么回报
 
@@ -96,7 +96,7 @@ engine  : dsh-liquid    enabled  v3.0.0  可加载（lib/index.js）
 Windows 上没有 bash，桌面版也从快捷方式启动、没有控制台，所以那边**不做“看日志再救”**，改成**启动前体检**：
 
 - 用桌面版自己的运行时（Electron 的 Node）把 profile 里每个插件 import 一次；
-- 导不进来就说明它一定会把启动拖垮 —— 先在 `cordis.patch.yml` 里停用它（只插一行，留 `.bak-guard`）；
+- 导不进来就说明它一定会把启动拖垮 —— 先在 `cordis.patch.yml` 里停用它（只插一行，动手前落一份快照）；
 - 然后才启动桌面版，并弹一个提示框告诉你停用了谁。
 
 ### 给 AI 的步骤
@@ -152,4 +152,4 @@ dsh web: http://127.0.0.1:<PORT>/?token=...
 
 - 桌面版安装位置按三个常见路径找；不在其中就传 `-AppPath`。
 - 只拦「导入失败」与「启动超时」；插件装上后工具报错这类它看不见。
-- 假阳性的代价很低：停用只插一行，原文留 `.bak-guard`，随时可以删掉那行恢复。
+- 假阳性的代价很低：停用只插一行，改动前的原文留在 `$DSH_HOME/guard-snapshots/`，随时可以删掉那行恢复。

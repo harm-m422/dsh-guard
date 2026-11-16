@@ -18,12 +18,86 @@ DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
 PROFILE_DIR="${DSH_PROFILE_DIR:-$DSH_HOME/profiles/web}"
 PATCH="$PROFILE_DIR/cordis.patch.yml"
 LOG="${DSH_GUARD_LOG:-$DSH_HOME/guard.log}"
-WEB_CMD="${DSH_WEB_CMD:-node $HOME/.dsh-cli/0.2.2-rc.1/node_modules/.bin/dsh web}"
+SNAP_DIR="${DSH_GUARD_SNAPSHOTS:-$DSH_HOME/guard-snapshots}"
+SNAP_KEEP="${DSH_GUARD_SNAP_KEEP:-5}"
+GRACE="${DSH_GUARD_GRACE:-120}"
 MAX_RESTART="${DSH_GUARD_MAX:-1}"
 NO_UI="${DSH_GUARD_NO_UI:-0}"
 
 mkdir -p "$(dirname "$LOG")"
 log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+# ── dsh 在哪：只有一套探测，启动与体检共用 ─────────────────────────────────
+# 以前这里写死过 0.2.2-rc.1：dsh 一升级，第 21 行的启动命令就指向不存在的目录，
+# 而第 4 级校验用的却是动态探测，于是会出现"起不来 + 体检说你好好的"。
+find_dsh_cli() {
+  local cli
+  cli="$(ls -td "$HOME"/.dsh-cli/*/node_modules/.bin/dsh 2>/dev/null | head -1)"
+  if [ -z "$cli" ]; then
+    cli="$(ls -td "$HOME"/.npm/_npx/*/node_modules/.bin/dsh 2>/dev/null | head -1)"
+  fi
+  printf '%s' "$cli"
+}
+
+resolve_web_cmd() {
+  if [ -n "${DSH_WEB_CMD:-}" ]; then printf '%s' "$DSH_WEB_CMD"; return; fi
+  local cli
+  cli="$(find_dsh_cli)"
+  if [ -n "$cli" ]; then printf 'node %s web' "$cli"; return; fi
+  printf 'dsh web'
+}
+
+WEB_CMD="$(resolve_web_cmd)"
+
+# ── 改用户配置之前先留证：带时间戳的快照，而不是单份覆盖 ────────────────────
+# 固定文件名（.bak-guard / .bak-clean）在连着自愈两次时，第一次的原文就被覆盖
+# 掉了 —— 而这个工具唯一的职责就是改 cordis.patch.yml。
+snapshot_patch() {
+  local reason="${1:-unknown}" stamp dir old
+  mkdir -p "$SNAP_DIR" || return 1
+  stamp="$(date '+%Y%m%d-%H%M%S')"
+  dir="$SNAP_DIR/$stamp-$reason"
+  # 同一秒里连着改两次也不能互相覆盖
+  [ -e "$dir" ] && dir="$dir-$$"
+  mkdir -p "$dir" || return 1
+  if [ -f "$PATCH" ]; then
+    cp -a "$PATCH" "$dir/cordis.patch.yml" 2>/dev/null || cp "$PATCH" "$dir/cordis.patch.yml"
+  fi
+  printf '%s\n' "$(date -Is)" >"$dir/AT"
+  printf '%s\n' "$reason" >"$dir/REASON"
+  # 只留最近 N 份；被挤出去的挪进 trash/，不删
+  mkdir -p "$SNAP_DIR/trash"
+  old="$(ls -1d "$SNAP_DIR"/*/ 2>/dev/null | grep -v '/last-good/' | grep -v '/trash/' | sort | head -n -"$SNAP_KEEP")"
+  if [ -n "$old" ]; then
+    while IFS= read -r one; do
+      [ -n "$one" ] || continue
+      mv "$one" "$SNAP_DIR/trash/$(basename "$one")-$$" 2>/dev/null || true
+    done <<<"$old"
+  fi
+  printf '%s' "$dir"
+}
+
+# 最后一次确认可用时的配置镜像：出事后想回到"上次是好的那一版"，看这里。
+snapshot_good() {
+  mkdir -p "$SNAP_DIR/last-good" || return 0
+  [ -f "$PATCH" ] && cp -a "$PATCH" "$SNAP_DIR/last-good/cordis.patch.yml" 2>/dev/null
+  printf '%s\n' "$(date -Is)" >"$SNAP_DIR/last-good/AT"
+}
+
+clean_start() {
+  local snap
+  snap="$(snapshot_patch 'clean-start')"
+  log "clean-start: snapshot at $snap"
+  local name
+  while IFS= read -r row; do
+    name=$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["name"])' "$row" 2>/dev/null) || continue
+    case "$name" in @*) continue ;; esac
+    # 只停第三方包：核心模块的 id 覆盖（如 compaction-basic）不在 node_modules 里，别碰
+    [ -d "$PROFILE_DIR/node_modules/$name" ] || continue
+    DSH_GUARD_SNAP="$snap" disable_target "$name" >/dev/null 2>&1 || true
+    log "clean-start: disabled $name"
+  done < <(plugins_in_patch)
+}
 
 # ── patch 里列出的插件（id 或 name）──────────────────────────────────────────
 plugins_in_patch() {
@@ -105,7 +179,10 @@ def found(node):
     return isinstance(node, dict) and (node.get('id') == target or node.get('name') == target) and node.get('disabled') is True
 if not isinstance(doc, list) or not any(found(n) for n in doc):
     print(json.dumps({"ok": False, "error": "edit did not take effect"})); sys.exit(0)
-open(path + '.bak-guard', 'w', encoding='utf-8').write(raw)
+import os
+snap = os.environ.get('DSH_GUARD_SNAP', '')
+if snap and os.path.isdir(snap):
+    open(os.path.join(snap, 'cordis.patch.yml'), 'w', encoding='utf-8').write(raw)
 open(path, 'w', encoding='utf-8').write(new)
 print(json.dumps({"ok": True, "disabled": target}))
 PY
@@ -115,7 +192,10 @@ PY
 blame_from_log() {
   local text="$1"
   local name
-  name=$(grep -oE 'did not activate[[:space:]]+[@A-Za-z0-9/_.-]+' <<<"$text" | head -1 | awk '{print $NF}')
+  # 两种语序都认：真日志里既有 "dsh-memory did not activate"，也有
+  # "did not activate dsh-memory"；只认一种就会在另一种上放过真凶。
+  name=$(grep -oE '[@A-Za-z0-9/_.-]+[[:space:]]+did not activate' <<<"$text" | head -1 | awk '{print $1}')
+  [ -z "$name" ] && name=$(grep -oE 'did not activate[[:space:]]+[@A-Za-z0-9/_.-]+' <<<"$text" | head -1 | awk '{print $NF}')
   [ -z "$name" ] && name=$(grep -oE 'Failed to load plugins[[:space:]]+[@A-Za-z0-9/_.-]+' <<<"$text" | head -1 | awk '{print $NF}')
   [ -z "$name" ] && name=$(grep -oE 'web boot:.*?([@A-Za-z0-9/_.-]+): ' <<<"$text" | head -1 | sed -E 's/.*?([@A-Za-z0-9/_.-]+): $/\1/')
   printf '%s' "$name"
@@ -127,7 +207,7 @@ issue_url_for() {
   python3 - "$PROFILE_DIR/node_modules/$name/package.json" "$name" <<'PY'
 import sys, json, re
 path, name = sys.argv[1], sys.argv[2]
-fallback = 'https://github.com/harm-m422/dsh-guard/issues/new'
+fallback = 'https://github.com/harm-m422/dsh-memory/issues/new'
 try:
     pkg = json.load(open(path, encoding='utf-8'))
 except Exception:
@@ -178,6 +258,12 @@ PYURL
     *) : ;;
   esac
 }
+
+# 调试/测试用：把真正会执行的启动命令打出来（解析逻辑只有一处）。
+if [ "${1:-}" = "--web-cmd" ]; then
+  printf '%s\n' "$WEB_CMD"
+  exit 0
+fi
 
 # ── 体检：patch 里的每个插件能不能被装起来 ─────────────────────────────────
 if [ "${1:-}" = "--check" ]; then
@@ -258,13 +344,23 @@ if [ "${1:-}" = "--heal-log" ]; then
   fi
   detail="$(grep -iE 'did not activate|Failed to load plugins|web boot:' /tmp/dsh-guard-tail.log | head -3 | tr '\n' ' ')"
   log "heal-log: blamed=$target detail=$detail"
-  result="$(disable_target "$target")"
+  snap="$(snapshot_patch "heal-log-$target")"
+  log "heal-log: snapshot at $snap"
+  result="$(DSH_GUARD_SNAP="$snap" disable_target "$target")"
   log "heal-log disable: $result"
   if ! grep -q '"ok": true' <<<"$result"; then
     echo "disable failed: $result" >&2
     exit 1
   fi
   tell_user "$target" "$detail"
+  exit 0
+fi
+
+# 调试/测试用：只做"干净启动"那一步（停用所有第三方插件），不启动进程。
+# 必须放在"已有实例就别再开"那段之前——本机 3080 天天开着，否则这里永远走不到。
+if [ "${1:-}" = "--clean-start" ]; then
+  clean_start
+  echo "clean-start done: $PATCH"
   exit 0
 fi
 
@@ -308,28 +404,29 @@ wait_healthy() {
   return 1
 }
 
-# 干净启动：把非核心插件全部停用（先整份备份）
-clean_start() {
-  local backup="$PATCH.bak-clean"
-  cp -a "$PATCH" "$backup" 2>/dev/null || true
-  log "clean-start: backup at $backup"
-  local name
-  while IFS= read -r row; do
-    name=$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["name"])' "$row" 2>/dev/null) || continue
-    case "$name" in @*) continue ;; esac
-    # 只停第三方包：核心模块的 id 覆盖（如 compaction-basic）不在 node_modules 里，别碰
-    [ -d "$PROFILE_DIR/node_modules/$name" ] || continue
-    disable_target "$name" >/dev/null 2>&1 || true
-    log "clean-start: disabled $name"
-  done < <(plugins_in_patch)
+# 「起来了」不等于「好了」：端口在听只说明它开始服务了。启动慢、起来又崩的
+# 那种假成功，必须靠宽限期抓——这段时间里进程没了、端口掉了、日志里出现失败
+# 标记，都算没起来。
+settle_healthy() {
+  local log="$1" pid="$2" span="$3"
+  local end=$(( $(date +%s) + span ))
+  while [ "$(date +%s)" -lt "$end" ]; do
+    if grep -qiE 'did not activate|Failed to load plugins|web boot:' "$log" 2>/dev/null; then return 2; fi
+    if ! kill -0 "$pid" 2>/dev/null; then return 3; fi
+    healthy || return 4
+    sleep 2
+  done
+  return 0
 }
+
+# 干净启动：把非核心插件全部停用（先整份备份）
 
 # harness 自身是否还可能修好：CLI 在不在、能不能报版本、盘还有没有空间
 verify_harness() {
   local cli note=()
-  cli="$(ls -td "$HOME"/.dsh-cli/*/node_modules/.bin/dsh 2>/dev/null | head -1)"
+  cli="$(find_dsh_cli)"
   if [ -z "$cli" ]; then
-    note+=("找不到 dsh 可执行文件（~/.dsh-cli/*/node_modules/.bin/dsh）")
+    note+=("找不到 dsh 可执行文件（~/.dsh-cli/*/node_modules/.bin/dsh 与 ~/.npm/_npx/*）")
   elif timeout 20 "$cli" --version >/tmp/dsh-guard-ver.log 2>&1; then
     note+=("dsh 可执行：$(head -c 40 /tmp/dsh-guard-ver.log | tr '\n' ' ')")
   else
@@ -371,9 +468,19 @@ while : ; do
   wait_healthy "$run_log" "$pid" "$HEALTH_TIMEOUT"
   verdict=$?
 
+  if [ "$verdict" -eq 0 ]; then
+    # 起来了，但还得守住宽限期；这段时间内倒下就是假成功
+    settle_healthy "$run_log" "$pid" "$GRACE"
+    verdict=$?
+    if [ "$verdict" -ne 0 ]; then
+      log "round $round: came up then fell over during grace (verdict=$verdict)"
+    fi
+  fi
+
   case "$verdict" in
     0)
-      log "round $round: healthy on :$PORT"
+      snapshot_good
+      log "round $round: healthy on :$PORT (grace ${GRACE}s ok)"
       if [ "$round" -gt 1 ]; then
         notify-send 'DSH 已启动' "第 $round 轮起来了${blamed:+（已停用 $blamed）}" 2>/dev/null || true
       fi
@@ -399,7 +506,9 @@ while : ; do
   sleep 1
 
   if [ "$round" -eq 1 ] && [ -n "$target" ]; then
-    result="$(disable_target "$target")"
+    snap="$(snapshot_patch "round1-$target")"
+    log "round 1: snapshot at $snap"
+    result="$(DSH_GUARD_SNAP="$snap" disable_target "$target")"
     log "round 1: disable $target -> $result"
     blamed="$target"
     tell_user "$target" "$detail"

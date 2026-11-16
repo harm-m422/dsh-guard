@@ -9,11 +9,14 @@ Thumbs.db
 # 分发的压缩包
 *.zip
 
-# 运行产物
+# 运行产物 / 手工备份
 *.log
+*.bak-*
 *.bak-guard
 *.bak-clean
 
+# 默认快照目录（若被指向仓库内）
+guard-snapshots/
+
 # Windows
-Thumbs.db
 desktop.ini

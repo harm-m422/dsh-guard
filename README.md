@@ -37,10 +37,11 @@ engine  : @deepseek-ai/dsh-client-ui-theme enabled  核心包（在 dsh 安装�
 
 ## 它怎么自愈（三级阶梯）
 
-每一级都给足 **120 秒**——启动慢不等于启动失败；「起来了」的判据是端口在听或 HTTP 2xx/3xx。
+每一级都给足 **120 秒**——启动慢不等于启动失败；「起来了」的判据是端口在听或 HTTP 2xx/3xx，
+**并且度过宽限期**（`DSH_GUARD_GRACE`，默认 120 秒）——启动后中途崩掉算假成功，继续降级。
 
-1. **停用肇事插件**：从日志认出 `did not activate <插件>`，只往 patch 里插一行 `disabled: true`（先 YAML 校验，原文留 `.bak-guard`），弹二选一（去 GitHub 报错 / 忽略），然后重启。
-2. **干净启动**：还起不来，就把**所有第三方插件**停用（核心模块的 id 覆盖不碰，例如 `compaction-basic`），patch 整份备份为 `.bak-clean`，再试一轮。
+1. **停用肇事插件**：从日志认出 `did not activate <插件>`，只往 patch 里插一行 `disabled: true`（先 YAML 校验，**动手前先落一份快照**），弹二选一（去 GitHub 报错 / 忽略），然后重启。
+2. **干净启动**：还起不来，就把**所有第三方插件**停用（核心模块的 id 覆盖不碰，例如 `compaction-basic`）——同样先落快照，再试一轮。
 3. **校验 harness**：干净启动也失败，就检查 dsh 可执行文件在不在、能不能 `--version`、`DSH_HOME` 还有多少空间，然后弹窗告知「harness 可能彻底损坏，建议重装」。
 
 一个细节：进程自己退出**不一定是失败**——退出码 0 或 ≥128（被信号杀掉，通常是用户关掉）视为正常结束，其它退出码才算崩溃，继续降级。
@@ -69,4 +70,39 @@ dsh-guard      主脚本（bash + python3）
 install.sh     安装/卸载
 README.md      这份
 README-AI.md   给 AI 照着装的版本
+```
+
+---
+
+## 1.1：改配置之前先留证
+
+**快照，不是覆盖。** 以前写 `cordis.patch.yml.bak-guard` / `.bak-clean` 两个固定文件名，
+连着自愈两次，第一次的原文就没了。现在每次动 patch 之前先落一份：
+
+```
+$DSH_HOME/guard-snapshots/<时间戳>-<原因>/
+    cordis.patch.yml   # 改动前的原文
+    AT                 # 什么时候
+    REASON             # 为什么改
+```
+
+只留最近 5 份（`DSH_GUARD_SNAP_KEEP`），被挤出去的**挪进 `trash/`，不删**。
+另外镜像一份 `last-good/`：最后一次通过宽限期确认可用的那份配置，出事后先看它。
+
+**「起来了」不等于「好了」。** 端口在听只说明开始服务了。启动后在宽限期
+（`DSH_GUARD_GRACE`，默认 120 秒）里持续盯着：进程没了、端口掉了、日志里出现失败
+标记，都算没起来，继续降级。通过宽限期才写 `last-good`。
+
+**启动命令只有一套探测。** 以前 `WEB_CMD` 写死过 `0.2.2-rc.1`，而第 4 级校验用的是
+动态扫最新版本——dsh 一升级就会出现"起不来 + 体检说你好好的"。现在两处共用
+`find_dsh_cli`：扫 `~/.dsh-cli/*`，再退 `~/.npm/_npx/*`，最后才回落 `dsh web`。
+`dsh-guard --web-cmd` 可以直接看会执行什么。
+
+**测试。** `node test.mjs`，24 项，全部在自己的临时 `DSH_HOME` 里跑：快照轮转、
+宽限期（起来又崩 / 稳定服务）、启动命令解析、体检、幂等、注释保留、干净启动只停
+第三方。不会碰真实 profile。
+
+```
+$ node test.mjs
+24/24 passed
 ```
