@@ -41,7 +41,7 @@ engine  : @deepseek-ai/dsh-client-ui-theme enabled  核心包（在 dsh 安装�
 **并且度过宽限期**（`DSH_GUARD_GRACE`，默认 120 秒）——启动后中途崩掉算假成功，继续降级。
 
 1. **停用肇事插件**：从日志认出 `did not activate <插件>`，只往 patch 里插一行 `disabled: true`（先 YAML 校验，**动手前先落一份快照**），弹二选一（去 GitHub 报错 / 忽略），然后重启。
-2. **干净启动**：还起不来，就把**所有第三方插件**停用（核心模块的 id 覆盖不碰，例如 `compaction-basic`）——同样先落快照，再试一轮。
+2. **干净启动**：还起不来，就把**所有第三方插件**停用（核心模块的 id 覆盖不碰，例如 `compaction-basic`），——同样先落快照，再试一轮。
 3. **校验 harness**：干净启动也失败，就检查 dsh 可执行文件在不在、能不能 `--version`、`DSH_HOME` 还有多少空间，然后弹窗告知「harness 可能彻底损坏，建议重装」。
 
 一个细节：进程自己退出**不一定是失败**——退出码 0 或 ≥128（被信号杀掉，通常是用户关掉）视为正常结束，其它退出码才算崩溃，继续降级。
@@ -105,4 +105,20 @@ $DSH_HOME/guard-snapshots/<时间戳>-<原因>/
 ```
 $ node test.mjs
 24/24 passed
+```
+
+### Windows 版同步（windows/dsh-guard.ps1）
+
+同样的三处已经一起改了：
+
+- **快照**：`%USERPROFILE%\.dsh\guard-snapshots\<时间戳>-<原因>\`，留 5 份，旧的进 `trash\`；`last-good\` 镜像最后一次确认可用的配置
+- **宽限期**：`-GraceSec`（默认 120）——端口通了之后再守一段，期间进程退出/端口掉了都算没起来
+- **点名插件**：`did not activate` 两种语序都认
+
+顺带修掉一个真 bug：`noentry`（package.json 指的入口文件不存在）和 `missing`（patch 里有、盘上没有）
+以前只打印不处理，而这两种同样会让 boot 停在 "Failed to load plugins"，现在都进了停用名单。
+
+```
+cd windows
+pwsh -NoProfile -File test.ps1      # 11 项，在 Linux 上也能跑
 ```

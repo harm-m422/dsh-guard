@@ -26,6 +26,7 @@ param(
   [switch]$Check,
   [switch]$NoLaunch,
   [int]$WaitSec = 120,
+  [int]$GraceSec = 120,
   [string]$Runtime = ""
 )
 
@@ -91,7 +92,7 @@ function Test-Disabled($name) {
   return $false
 }
 
-function Disable-Plugin($name) {
+function Disable-Plugin($name, [string]$snapshot = "") {
   $lines = Get-Content -LiteralPath $patch
   $out = @()
   $inserted = $false
@@ -121,9 +122,43 @@ function Disable-Plugin($name) {
     $i = $j
   }
   if (-not $inserted) { return $false }
-  Copy-Item -LiteralPath $patch -Destination "$patch.bak-guard" -Force
+  if (-not $snapshot) { $snapshot = Save-PatchSnapshot "disable-$name" }
   Set-Content -LiteralPath $patch -Value $out -Encoding UTF8
   return $true
+}
+
+# ── 改配置之前先留证：带时间戳的快照，而不是单份覆盖 ───────────────────────
+# 固定文件名（$patch.bak-guard）在连着自愈两次时，第一次的原文就被覆盖掉了。
+function Save-PatchSnapshot([string]$reason) {
+  $root = Join-Path $DshHome "guard-snapshots"
+  New-Item -ItemType Directory -Force -Path $root | Out-Null
+  $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+  $dir = Join-Path $root "$stamp-$reason"
+  $n = 1
+  while (Test-Path $dir) { $dir = Join-Path $root "$stamp-$reason-$n"; $n++ }
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  Copy-Item -LiteralPath $patch -Destination (Join-Path $dir "cordis.patch.yml") -Force
+  Set-Content -LiteralPath (Join-Path $dir "AT") -Value (Get-Date -Format o) -Encoding UTF8
+  Set-Content -LiteralPath (Join-Path $dir "REASON") -Value $reason -Encoding UTF8
+  $trash = Join-Path $root "trash"
+  New-Item -ItemType Directory -Force -Path $trash | Out-Null
+  $all = @(Get-ChildItem -Directory -LiteralPath $root |
+    Where-Object { $_.Name -ne "trash" -and $_.Name -ne "last-good" } |
+    Sort-Object Name)
+  if ($all.Count -gt 5) {
+    foreach ($old in ($all | Select-Object -First ($all.Count - 5))) {
+      Move-Item -LiteralPath $old.FullName -Destination (Join-Path $trash $old.Name) -Force -ErrorAction SilentlyContinue
+    }
+  }
+  return $dir
+}
+
+# 最后一次确认可用的配置镜像：出事后先看它。
+function Save-GoodSnapshot {
+  $dir = Join-Path (Join-Path $DshHome "guard-snapshots") "last-good"
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  Copy-Item -LiteralPath $patch -Destination (Join-Path $dir "cordis.patch.yml") -Force
+  Set-Content -LiteralPath (Join-Path $dir "AT") -Value (Get-Date -Format o) -Encoding UTF8
 }
 
 function Get-Entry($dir) {
@@ -206,19 +241,39 @@ function Wait-AppHealthy($proc, $log, [int]$sec) {
   return @{ ok = $false; reason = "timeout"; port = (Get-ServedPort $log) }
 }
 
+# 「起来了」不等于「好了」：端口通了之后再守一段，期间进程没了或端口掉了都算失败。
+function Test-AppSettled($proc, $log, [int]$sec) {
+  $deadline = (Get-Date).AddSeconds($sec)
+  while ((Get-Date) -lt $deadline) {
+    if ((Get-LogText $log) -match 'did not activate|Failed to load plugins') {
+      return @{ ok = $false; reason = "boot-failed" }
+    }
+    if ($proc.HasExited) { return @{ ok = $false; reason = "exited" } }
+    $port = Get-ServedPort $log
+    if ($port -le 0 -or -not (Test-PortUp $port)) { return @{ ok = $false; reason = "port-down" } }
+    Start-Sleep -Seconds 2
+  }
+  return @{ ok = $true }
+}
+
 function Get-Blamed($log) {
-  $m = [regex]::Match((Get-LogText $log), 'did not activate\s+([@A-Za-z0-9/_.-]+)')
+  $text = Get-LogText $log
+  # 两种语序都认：真日志里既有 "dsh-memory did not activate"，也有反向写法。
+  $m = [regex]::Match($text, '([@A-Za-z0-9/_.-]+)\s+did not activate')
+  if ($m.Success) { return $m.Groups[1].Value }
+  $m = [regex]::Match($text, 'did not activate\s+([@A-Za-z0-9/_.-]+)')
   if ($m.Success) { return $m.Groups[1].Value }
   return ""
 }
 
 function Disable-AllThirdParty {
+  $snap = Save-PatchSnapshot "clean-start"
   foreach ($row in Get-Plugins) {
     if ($row.kind -ne "pkg") { continue }
     if ($row.name.StartsWith("@")) { continue }
     if (-not (Test-Path (Join-Path $nodeModules $row.name))) { continue }
     if (Test-Disabled $row.name) { continue }
-    Disable-Plugin $row.name | Out-Null
+    Disable-Plugin $row.name $snap | Out-Null
     Write-Host "已停用：$($row.name)"
   }
 }
@@ -244,14 +299,16 @@ foreach ($row in Get-Plugins) {
   if (Test-Disabled $name) { Write-Host ("engine  : {0,-28} disabled" -f $name); continue }
   $r = Test-Plugin $name $runtime
   Write-Host ("engine  : {0,-28} {1}  {2}" -f $name, $r.state, $r.detail)
-  if ($r.state -eq "fail") { $bad += $name }
+  # fail=导入就抛；noentry=package.json 指的入口文件不存在；missing=patch 里有、盘上没有。
+  # 后两种同样会让 boot 停在 "Failed to load plugins"，所以一样要停用。
+  if ($r.state -in @("fail", "noentry", "missing")) { $bad += $name }
 }
 
 if ($Check) { exit 0 }
 
 # 第一级：启动前停用导不进来的插件
 if ($bad.Count -gt 0) {
-  foreach ($name in $bad) { if (Disable-Plugin $name) { Write-Host "已停用：$name（备份 $patch.bak-guard）" } }
+  foreach ($name in $bad) { if (Disable-Plugin $name) { Write-Host "已停用：$name（改动前已快照）" } }
   if ($IsWindows -ne $false) {
     Add-Type -AssemblyName System.Windows.Forms | Out-Null
     [System.Windows.Forms.MessageBox]::Show(
@@ -267,22 +324,29 @@ $log = Join-Path ([System.IO.Path]::GetTempPath()) "dsh-desktop-guard.log"
 function Launch-And-Wait($label) {
   $p = Start-AppWithLog $app $log
   $h = Wait-AppHealthy $p $log $WaitSec
-  Write-Host ("{0}：{1} {2}" -f $label, $h.ok, $(if ($h.port) { "端口 " + $h.port } else { $h.reason }))
+  if ($h.ok) {
+    $settled = Test-AppSettled $p $log $GraceSec
+    if (-not $settled.ok) {
+      Write-Host ("{0}：端口通了，但宽限期里倒下了（{1}）" -f $label, $settled.reason)
+      $h = @{ ok = $false; reason = "grace:" + $settled.reason; port = $h.port }
+    }
+  }
+  Write-Host ("{0}：{1} {2}" -f $label, $h.ok, $(if ($h.ok) { "端口 " + $h.port } else { $h.reason }))
   return @{ proc = $p; health = $h }
 }
 
 # 第一轮：启动（导入坏掉的插件已在体检阶段停用）
 $r = Launch-And-Wait "启动结果"
-if ($r.health.ok) { exit 0 }
+if ($r.health.ok) { Save-GoodSnapshot; exit 0 }
 $blamed = Get-Blamed $log
 try { $r.proc.Kill() } catch { }
 
 # 第二轮：停用日志点名的插件，再等一轮
 if ($blamed -and -not (Test-Disabled $blamed)) {
   Write-Host "日志点名：$blamed —— 停用它再试"
-  if (Disable-Plugin $blamed) { Write-Host "已停用：$blamed（备份 $patch.bak-guard）" }
+  if (Disable-Plugin $blamed) { Write-Host "已停用：$blamed（改动前已快照）" }
   $r = Launch-And-Wait "停用后启动结果"
-  if ($r.health.ok) { exit 0 }
+  if ($r.health.ok) { Save-GoodSnapshot; exit 0 }
   try { $r.proc.Kill() } catch { }
 } else {
   Write-Host "日志没有点名任何插件（或已停用），直接干净启动"
@@ -292,7 +356,7 @@ if ($blamed -and -not (Test-Disabled $blamed)) {
 Write-Host "尝试干净启动：停用全部第三方插件"
 Disable-AllThirdParty
 $r = Launch-And-Wait "干净启动结果"
-if ($r.health.ok) { exit 0 }
+if ($r.health.ok) { Save-GoodSnapshot; exit 0 }
 try { $r.proc.Kill() } catch { }
 
 # 第四轮：校验安装与日志，交给人
