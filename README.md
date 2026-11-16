@@ -56,6 +56,24 @@ engine  : @deepseek-ai/dsh-client-ui-theme enabled  核心包（在 dsh 安装�
 ./install.sh --uninstall  # 卸载
 ```
 
+### 更新
+
+```bash
+rm -rf dsh-guard && unzip dsh-guard-X.Y.Z.zip   # 先删旧目录，别直接覆盖解压
+cd dsh-guard && ./install.sh --desktop
+```
+
+三个坑，都是实测出来的：
+
+- **直接 `unzip` 覆盖会失败**：目标文件已存在时它会问 `replace …? [y]es, [n]o…`，
+  非交互环境下读不到输入，直接 `(EOF or read error, treating as "[N]one")` 并以 **exit 1** 退出 ——
+  `&&` 链断在这里，安装根本没跑。
+- **`unzip -o` 能过，但不删旧文件**：新版本里去掉或改名的文件会留在原地。
+- **只解压不会更新已安装的副本**：`install.sh` 做的是**拷贝**，不是软链，
+  `~/.local/bin/dsh-guard` 仍是旧的。必须重跑 `./install.sh`。
+
+快照与状态都在 `$DSH_HOME` 下，更新不会动它们。
+
 ## 边界
 
 - **Linux/macOS** 用 `dsh-guard`（看日志自愈）；**Windows 桌面版**用 `windows\dsh-guard.ps1`：自己启动桌面版、从输出里取系统分配的端口、按同样的三级阶梯恢复（体检 → 停用点名的插件 → 干净启动 → 校验并建议重装）。

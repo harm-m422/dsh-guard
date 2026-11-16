@@ -26,15 +26,21 @@ for arg in "$@"; do
 done
 
 if [ "$MODE" = "uninstall" ]; then
+  # 先记下"有没有"，再删 —— 删完再判断永远是假，那就会误报「本来就没有」。
+  had_target=0; [ -f "$TARGET" ] && had_target=1
+  had_entry=0;  [ -f "$ENTRY" ]  && had_entry=1
   rm -f "$TARGET" "$ENTRY"
-  echo "已卸载：$TARGET"
-  [ -f "$ENTRY" ] || echo "（桌面入口本来就没有）"
+  if [ "$had_target" = 1 ]; then echo "已卸载：$TARGET"; else echo "（$TARGET 本来就不存在）"; fi
+  if [ "$had_entry" = 1 ];  then echo "已删除桌面入口：$ENTRY"; else echo "（桌面入口本来就没有）"; fi
   exit 0
 fi
 
 mkdir -p "$PREFIX"
+# 安装是**拷贝**，不是软链：只解压新版本不会更新这里，必须重跑本脚本。
+if [ -f "$TARGET" ]; then echo "检测到已安装，覆盖更新"; fi
 install -m 755 "$HERE/dsh-guard" "$TARGET"
-echo "已安装：$TARGET"
+VER="$(cat "$HERE/VERSION" 2>/dev/null || echo unknown)"
+echo "已安装：$TARGET（版本 $VER）"
 
 # 立刻跑一次体检，成功与否都不中止安装
 echo

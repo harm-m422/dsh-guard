@@ -38,6 +38,16 @@ chmod +x install.sh dsh-guard
 ```
 
 `install.sh` 会：把 `dsh-guard` 装到 `~/.local/bin`、立刻跑一次体检、建桌面入口「DSH（守护启动）」。
+
+### 更新
+
+```bash
+rm -rf dsh-guard && unzip dsh-guard-X.Y.Z.zip
+cd dsh-guard && ./install.sh --desktop
+```
+
+**不要直接 `unzip` 覆盖**：文件已存在时它交互式问 `replace?`，非交互下读不到输入会以 **exit 1** 失败，
+`&&` 链直接断。**也不要以为解压就等于更新** —— `install.sh` 是拷贝，不重跑就还是旧版本。
 它**不会**修改用户的其它插件配置，也**不会**用 sudo。
 
 ## 验收（全过才算装好）
